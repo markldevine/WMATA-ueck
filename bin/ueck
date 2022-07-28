@@ -1,5 +1,6 @@
 #!/usr/bin/env raku
 
+use Async::Command::Multi;
 use Data::Dump::Tree;
 #use Grammar::Debugger;
 #use Grammar::Tracer;
@@ -10,33 +11,122 @@ use Redis::Client::SelectServerIP;
 constant $users-allow-file  = '/etc/opt/quest/vas/users.allow';
 constant $vastool           = '/opt/quest/bin/vastool';
 
+my %Station-Terminals;
+my %all-groups;
+my $users-to-verify         = SetHash.new;
+my $groups-allowed          = SetHash.new;
+my SetHash %users-to-groups;
+
 my $redis                   = Redis::Client::SelectServerIP.new.connection;
 my @Station-Terminals-Raw   = $redis.smembers('fg:st:lc:all').list.sort({ $^a.fc cmp $^b.fc });
 
-my %Station-Terminals;
-for @Station-Terminals-Raw -> $station-terminal {
-    next unless %Station-Terminals{$station-terminal}<pingable>;
-    printf "%-25s%s\n", %Station-Terminals{$station-terminal}<canonical-name>, %Station-Terminals{$station-terminal}<ip-address>;
+#nslookup-forward();
+#ping();
+#for @Station-Terminals-Raw -> $station-terminal {
+#    next unless %Station-Terminals{$station-terminal}<pingable>;
+#    printf "%-25s%s\n", %Station-Terminals{$station-terminal}<canonical-name>, %Station-Terminals{$station-terminal}<ip-address>;
+#}
+
+#   Grammars
+
+grammar NSLOOKUP_FORWARD {
+    token TOP {
+        <dns-server-name> \n+
+        <dns-server-address> \n+
+        <non-auth-answer>*
+        <host-name> \n+
+        <host-address> \n+
+    }
+    token non-auth-answer {
+        'Non-authoritative answer:'
+        \n+
+    }
+    token dns-server-name {
+        ^^
+        'Server:'
+        \s+
+        $<dns-server-string> = .+?
+        $$
+    }
+    token dns-server-address {
+        ^^
+        'Address:'
+        \s+
+        $<dns-server-ip-address> = <ip-address-format>
+        '#'
+        $<dns-server-port> = \d+
+        $$
+    }
+    token host-name {
+        ^^
+        'Name:'
+        \s+
+        $<host-name-string> = .+?
+        $$
+    }
+    token host-address {
+        ^^
+        'Address:'
+        \s+
+        $<host-ip-address> = <ip-address-format>
+        $$
+    }
+    token ip-address-format {
+        \d ** 1..3 '.' \d ** 1..3 '.' \d ** 1..3 '.' \d ** 1..3
+    }
 }
 
+#   Check if supplied hostname is resolvable into an IP address
 
-my %all-groups;
-my $users-to-verify         = SetHash.new;
+sub nslookup-forward {
+    my %command;
+    for @Station-Terminals-Raw -> $station-terminal {
+        %command{$station-terminal} = 'nslookup', $station-terminal;
+    }
+    my %result = Async::Command::Multi.new(:%command, :5time-out, :10batch, :2attempts, :delay(.5)).sow.reap;
+    for @Station-Terminals-Raw -> $station-terminal {
+        if %result{$station-terminal}.exit-code == 0 {
+            my $m = NSLOOKUP_FORWARD.parse(%result{$station-terminal}.stdout-results);
+            %Station-Terminals{$station-terminal}<ip-address>       = ~$m<host-address><host-ip-address>;
+            %Station-Terminals{$station-terminal}<canonical-name>   = ~$m<host-name><host-name-string>;
+        }
+        else {
+            note "$station-terminal nslookup failed"
+        }
+    }
+}
+
+#   Check if pings are echoed
+
+sub ping {
+    my %command;
+    for @Station-Terminals-Raw -> $station-terminal {
+        %command{$station-terminal} = '/usr/bin/ping', '-c', '1', '-w', '1', %Station-Terminals{$station-terminal}<ip-address>;
+    }
+    my %result = Async::Command::Multi.new(:%command, :10time-out, :60batch, :2attempts, :delay(.5)).sow.reap;
+    for @Station-Terminals-Raw -> $station-terminal {
+        given %result{$station-terminal}.exit-code {
+            when 0  { %Station-Terminals{$station-terminal}<pingable> = True; }
+            default { %Station-Terminals{$station-terminal}<pingable> = False; }
+        }
+    }
+}
+
+#   Read all VAS groups directly from Active Directory
 
 sub get-all-groups {
     my $proc = run $vastool, 'list', '-l', 'groups', :out;
     for $proc.out.lines {
-#   for "/home/#######/AD/list-l-groups".IO.lines {
+#   for "/home/A028441/AD/list-l-groups".IO.lines {
         my @fields  = .split(/':'/);
         next        unless @fields[3] && @fields[3].elems;
         my $group   = @fields[0].subst(/^.*?\\/);
         my @ids;
         for @fields[3].split(/';'/) -> $record {
-            if $record.match(/^ 'CN=' (<alpha> <digit> ** 6) >>/) {
+            if $record.match(/^ 'CN=' (<alnum>+) >>/) {
                 @ids.append: $0.Str;
-            }
-            elsif $record.match(/^ 'CN=' (<alnum>+) >>/) {
-                @ids.append: $0.Str;
+                %users-to-groups{$0.Str} = SetHash.new unless %users-to-groups{$0.Str}.defined;
+                %users-to-groups{$0.Str}.set: $group.uc;
             }
             else {
                 warn 'Unexpected record: ', $record;
@@ -46,14 +136,17 @@ sub get-all-groups {
     }
 }
 
+#   Read $users-allow-file
+
 sub get-users-allowed {
-    my $proc = run '/usr/bin/ssh', 'xxxxxxxx.xxxxx.xxxxx', 'cat', $users-allow-file, :out;
-    for $proc.out.lines {
-#   for "/home/#######/AD/users.allow".IO.lines {
+#   my $proc = run '/usr/bin/ssh', 'xxxxxxxx.xxxxx.xxxxx', 'cat', $users-allow-file, :out;
+#   for $proc.out.lines {
+    for "/home/A028441/AD/users.allow".IO.lines {
         next if /^\s*$/ || /^\s*'#'/;
         if /^ .+? '\\' (<alnum>+) $/ {
             my $group-or-user = $0.Str;
             if %all-groups{$group-or-user.uc}:exists {
+                $groups-allowed.set($group-or-user.uc);
                 $users-to-verify.set($_) for %all-groups{$group-or-user.uc}.values;
             }
             else {
@@ -75,8 +168,9 @@ get-all-groups();
 get-users-allowed();
 
 my @pending-ue;
-for $users-to-verify.keys -> $user {
-    next if run($vastool, 'isvas', 'user', $user, :out).so;
+for $users-to-verify.keys.sort -> $user {
+    next unless %users-to-groups{$user} ∩ $groups-allowed;      # say $user, "\t", %users-to-groups{$user} ∩ $groups-allowed;
+    next if run($vastool, 'isvas', 'user', $user, :out).so;     say $user, "\t", %users-to-groups{$user}.keys;
     @pending-ue.append: $user;
 }
 
@@ -111,28 +205,6 @@ sub centralized-sudo {
         }
     }
 }
-
-#   Check if pings are echoed
-
-sub ping {
-    my %command;
-    for @Station-Terminals-Raw -> $station-terminal {
-        %command{$station-terminal} = 'ping', '-c', '1', '-w', '1', %Station-Terminals{$station-terminal}<ip-address>;
-    }
-    my %result = Async::Command::Multi.new(:%command, :10time-out, :60batch, :2attempts, :delay(.5)).sow.reap;
-    for @Station-Terminals-Raw -> $station-terminal {
-        given %result{$station-terminal}.exit-code {
-            when 0  { %Station-Terminals{$station-terminal}<pingable> = True; }
-            default { %Station-Terminals{$station-terminal}<pingable> = False; }
-        }
-    }
-}
-
-    
-    }
-}
-
-
 sub MAIN (
     Bool :$nosudo,                  #= report pingable STs with NO centralized SUDO connectivity
     Bool :$vr,                      #= query pingable STs' operating system V.Rs
