@@ -20,8 +20,8 @@ my SetHash %users-to-groups;
 my $redis                   = Redis::Client::SelectServerIP.new.connection;
 my @Station-Terminals-Raw   = $redis.smembers('fg:st:lc:all').list.sort({ $^a.fc cmp $^b.fc });
 
-#nslookup-forward();
-#ping();
+nslookup-forward();
+ping();
 #for @Station-Terminals-Raw -> $station-terminal {
 #    next unless %Station-Terminals{$station-terminal}<pingable>;
 #    printf "%-25s%s\n", %Station-Terminals{$station-terminal}<canonical-name>, %Station-Terminals{$station-terminal}<ip-address>;
@@ -170,9 +170,13 @@ get-users-allowed();
 my @pending-ue;
 for $users-to-verify.keys.sort -> $user {
     next unless %users-to-groups{$user} ∩ $groups-allowed;      # say $user, "\t", %users-to-groups{$user} ∩ $groups-allowed;
-    next if run($vastool, 'isvas', 'user', $user, :out).so;     say $user, "\t", %users-to-groups{$user}.keys;
-    @pending-ue.append: $user;
+    next if run($vastool, 'isvas', 'user', $user, :out).so;     # say $user, "\t", %users-to-groups{$user}.keys;
+    @pending-ue.append: $user;                                  # say $user;
 }
+
+#my $mail = run '/usr/bin/mailx', '-s', 'FG ST: UNIX-enablement Check', 'ITIO_FaregateLinuxadmins@wmata.com', :in;
+#$mail.in.put: @pending-ue.elems, ' user ids of ', $users-to-verify.elems, ' require UNIX-enablement';
+#$mail.in.close;
 
 put @pending-ue.elems, ' user ids of ', $users-to-verify.elems, ' require UNIX-enablement';
 
